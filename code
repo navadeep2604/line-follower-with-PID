@@ -1,0 +1,180 @@
+#define AIN1 A1
+#define AIN2 A2
+#define BIN1 A3
+#define BIN2 A4
+#define PWMA 10
+#define PWMB 11
+#define STBY A0
+
+#define IR1 2
+#define IR2 3
+#define IR3 4
+#define IR4 5
+#define IR5 6
+#define IR6 7
+#define IR7 8
+#define IR8 9
+
+#define RED_LED 13
+#define WHITE_LED 12
+
+// Speed constants (tightly tuned for 30 mm lines and 90° turns)
+const int baseSpeed = 80;   // Base speed for straight sections
+const int maxSpeed = 150;   // Max speed for motors
+const int minSpeed = 30;    // Min speed to prevent stalling
+
+// PID constants (integer-based for faster computation, tuned for sharp turns)
+const int Kp = 40;   // Proportional gain (integer for speed)
+const int Ki = 3;    // Integral gain (scaled down, integer)
+const int Kd = 25;   // Derivative gain (integer)
+int lastError = 0;
+int integral = 0;
+bool robotActive = true;
+
+// Sensor array setup
+const uint8_t numSensors = 8;
+const uint8_t sensorPins[numSensors] = {IR1, IR2, IR3, IR4, IR5, IR6, IR7, IR8};
+const int16_t sensorSpacing = 50;  // Integer spacing for 30 mm lines
+const int16_t centerPosition = 175; // Center of sensor array (7 * 50 / 2)
+
+// Line detection thresholds
+const unsigned long lineLossTimeout = 500;  // Allow 500ms to recover from line loss
+const unsigned long endZoneTimeout = 1000;  // 1 second to detect the 300 mm x 300 mm end box
+
+// Debugging flag (set to false for competition)
+const bool debugMode = false;
+
+void setup() {
+    // Motor control pins
+    pinMode(AIN1, OUTPUT);
+    pinMode(AIN2, OUTPUT);
+    pinMode(BIN1, OUTPUT);
+    pinMode(BIN2, OUTPUT);
+    pinMode(PWMA, OUTPUT);
+    pinMode(PWMB, OUTPUT);
+    pinMode(STBY, OUTPUT);
+
+    // Sensor pins (use fast digital reads)
+    for (uint8_t i = 0; i < numSensors; i++) {
+        pinMode(sensorPins[i], INPUT);
+    }
+
+    // LED pins
+    pinMode(RED_LED, OUTPUT);
+    pinMode(WHITE_LED, OUTPUT);
+
+    // Initial state
+    digitalWrite(STBY, HIGH);
+    digitalWrite(WHITE_LED, HIGH);
+    digitalWrite(RED_LED, LOW);
+
+    if (debugMode) {
+        Serial.begin(115200);  // Faster baud rate for testing
+        Serial.println("System Powered On. Robot Starting...");
+    }
+}
+
+void loop() {
+    static unsigned long lastLineLoss = 0;
+    static unsigned long endZoneStart = 0;
+    static bool inEndZone = false;
+
+    if (!robotActive) return;
+
+    // Read sensors (use direct port manipulation for speed, if possible, or fast digitalRead)
+    uint8_t sensors[numSensors];
+    for (uint8_t i = 0; i < numSensors; i++) {
+        sensors[i] = digitalRead(sensorPins[i]);
+    }
+
+    // Calculate line position (optimized integer math)
+    uint8_t blackCount = 0;
+    int16_t sum = 0;
+    for (uint8_t i = 0; i < numSensors; i++) {
+        if (sensors[i] == 1) {  // 1 = line detected (black line on white background)
+            blackCount++;
+            sum += i * sensorSpacing;
+        }
+    }
+
+    // Handle line loss or end zone detection
+    if (blackCount == 0) {
+        if (millis() - lastLineLoss > lineLossTimeout) {
+            stopMotors();
+            robotActive = false;
+            digitalWrite(WHITE_LED, LOW);
+            digitalWrite(RED_LED, HIGH);
+            if (debugMode) Serial.println("Line Lost or Race Completed!");
+            return;
+        }
+    } else {
+        lastLineLoss = millis();
+    }
+
+    // Detect end zone (all sensors on white for a sustained period)
+    if (blackCount == numSensors) {  // All sensors on white (end box)
+        if (!inEndZone) {
+            endZoneStart = millis();
+            inEndZone = true;
+        } else if (millis() - endZoneStart >= endZoneTimeout) {
+            stopMotors();
+            robotActive = false;
+            digitalWrite(WHITE_LED, LOW);
+            digitalWrite(RED_LED, HIGH);
+            if (debugMode) Serial.println("End Zone Reached!");
+            return;
+        }
+    } else {
+        inEndZone = false;
+    }
+
+    // Compute PID (integer-based for speed)
+    int16_t position = (sum / blackCount);
+    int16_t error = position - centerPosition;
+    integral = constrain(integral + error, -500, 500);
+    int16_t derivative = error - lastError;
+    int16_t correction = (Kp * error + Ki * integral + Kd * derivative) / 100;  // Scale down for motor range
+    lastError = error;
+
+    // Dynamic speed adjustment for sharp 90° turns
+    int16_t adjustedBaseSpeed = baseSpeed;
+    if (abs(error) > 100) {  // Lower threshold for 90° turns
+        adjustedBaseSpeed = (baseSpeed * 6) / 10;  // Integer division for 60% speed
+    }
+
+    // Calculate motor speeds (ensure integer operations)
+    int16_t leftSpeed = constrain(adjustedBaseSpeed + correction, minSpeed, maxSpeed);
+    int16_t rightSpeed = constrain(adjustedBaseSpeed - correction, minSpeed, maxSpeed);
+
+    // Drive motors
+    moveForward(leftSpeed, rightSpeed);
+
+    // Optional debug output (only in debug mode, limited frequency)
+    if (debugMode) {
+        static unsigned long lastPrint = 0;
+        if (millis() - lastPrint >= 100) {
+            Serial.print("Pos: "); Serial.print(position);
+            Serial.print(" Err: "); Serial.print(error);
+            Serial.print(" Corr: "); Serial.println(correction);
+            lastPrint = millis();
+        }
+    }
+}
+
+void moveForward(int leftSpeed, int rightSpeed) {
+    analogWrite(PWMA, leftSpeed);
+    analogWrite(PWMB, rightSpeed);
+    digitalWrite(AIN1, HIGH);
+    digitalWrite(AIN2, LOW);
+    digitalWrite(BIN1, HIGH);
+    digitalWrite(BIN2, LOW);
+}
+
+void stopMotors() {
+    analogWrite(PWMA, 0);
+    analogWrite(PWMB, 0);
+    digitalWrite(AIN1, LOW);
+    digitalWrite(AIN2, LOW);
+    digitalWrite(BIN1, LOW);
+    digitalWrite(BIN2, LOW);
+}
